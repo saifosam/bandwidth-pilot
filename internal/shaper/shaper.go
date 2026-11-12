@@ -61,14 +61,41 @@ type Quota struct {
 	Bytes int64 `json:"bytes"`
 }
 
+// Schedule limits when a rule is in force. Outside the window the app is
+// treated as if it had no rule at all.
+type Schedule struct {
+	On   bool    `json:"on"`
+	Days [7]bool `json:"days"` // indexed by time.Weekday: Sunday = 0
+	From int     `json:"from"` // minutes after midnight
+	To   int     `json:"to"`   // minutes after midnight; To <= From means overnight
+}
+
+// Active reports whether the schedule allows the rule at time t.
+func (sc Schedule) Active(t time.Time) bool {
+	if !sc.On {
+		return true
+	}
+	m := t.Hour()*60 + t.Minute()
+	wd := int(t.Weekday())
+	switch {
+	case sc.From == sc.To: // all day
+		return sc.Days[wd]
+	case sc.From < sc.To:
+		return sc.Days[wd] && m >= sc.From && m < sc.To
+	default: // overnight: the part after midnight belongs to the previous day
+		return (sc.Days[wd] && m >= sc.From) || (sc.Days[(wd+6)%7] && m < sc.To)
+	}
+}
+
 // Rule is everything the user can configure for one app.
 type Rule struct {
-	BlockIn  bool  `json:"blockIn"`
-	BlockOut bool  `json:"blockOut"`
-	LimitIn  Limit `json:"limitIn"`
-	LimitOut Limit `json:"limitOut"`
-	Priority int   `json:"priority"`
-	Quota    Quota `json:"quota"`
+	BlockIn  bool     `json:"blockIn"`
+	BlockOut bool     `json:"blockOut"`
+	LimitIn  Limit    `json:"limitIn"`
+	LimitOut Limit    `json:"limitOut"`
+	Priority int      `json:"priority"`
+	Quota    Quota    `json:"quota"`
+	Schedule Schedule `json:"schedule"`
 }
 
 // DefaultRule is the rule an app has when the user has not touched it.
@@ -77,7 +104,15 @@ func DefaultRule() Rule { return Rule{Priority: PrioNormal} }
 // IsDefault reports whether the rule does nothing.
 func (r *Rule) IsDefault() bool {
 	return r == nil || (!r.BlockIn && !r.BlockOut && !r.LimitIn.On && !r.LimitOut.On &&
-		r.Priority == PrioNormal && !r.Quota.On)
+		r.Priority == PrioNormal && !r.Quota.On && !r.Schedule.On)
+}
+
+// enforces reports whether the rule changes how traffic is handled
+// (a schedule on its own does nothing).
+func (r *Rule) enforces() bool {
+	c := *r
+	c.Schedule = Schedule{}
+	return !c.IsDefault()
 }
 
 func (r *Rule) limit(d Dir) Limit {
@@ -118,6 +153,7 @@ func (c *Config) capRate(d Dir) float64 {
 // engine uses them to re-inject the packet when it is released.
 type Packet struct {
 	App  *App
+	Also *App // the process app, when App is a website rule that took over shaping
 	Dir  Dir
 	Size int
 	Data []byte
@@ -131,11 +167,15 @@ type App struct {
 	ID   string
 	Name string
 	Path string
+	// Parent is the id of the app this one was split from (per-process rows).
+	Parent string
 
-	passed  [2]atomic.Int64 // bytes let through, per direction
-	dropped [2]atomic.Int64 // bytes discarded, per direction
-	used    atomic.Int64    // bytes counted against today's quota
-	rule    atomic.Pointer[Rule]
+	passed  [2]atomic.Int64      // bytes let through, per direction
+	dropped [2]atomic.Int64      // bytes discarded, per direction
+	used    atomic.Int64         // bytes counted against today's quota
+	rule    atomic.Pointer[Rule] // as configured
+	eff     atomic.Pointer[Rule] // what is in force right now (nil outside its schedule)
+	pending atomic.Bool          // held back until the user allows or blocks it
 
 	// Everything below is guarded by Shaper.mu.
 	q       [2]fifo
@@ -166,9 +206,16 @@ func (a *App) Rule() Rule {
 	return DefaultRule()
 }
 
+// InForce reports whether the app's rule currently applies (it may be
+// outside its schedule).
+func (a *App) InForce() bool { return a.eff.Load() != nil }
+
+// Pending reports whether the app is waiting for an allow/block decision.
+func (a *App) Pending() bool { return a.pending.Load() }
+
 // QuotaExceeded reports whether the app is currently cut off by its quota.
 func (a *App) QuotaExceeded() bool {
-	r := a.rule.Load()
+	r := a.eff.Load()
 	return r != nil && r.Quota.On && r.Quota.Bytes > 0 && a.used.Load() >= r.Quota.Bytes
 }
 
@@ -190,6 +237,7 @@ type Shaper struct {
 	now         func() time.Time
 	intercept   atomic.Bool
 	onIntercept func(bool)
+	onNewApp    func(*App)
 }
 
 const (
@@ -214,6 +262,16 @@ func (s *Shaper) SetRelease(f func(*Packet)) { s.release = f }
 
 // SetClock replaces the time source (tests).
 func (s *Shaper) SetClock(now func() time.Time) { s.now = now }
+
+// OnNewApp registers a callback fired once for every app the shaper creates.
+func (s *Shaper) OnNewApp(f func(*App)) { s.onNewApp = f }
+
+// SetPending holds back (or releases) all of an app's traffic.
+func (s *Shaper) SetPending(a *App, on bool) {
+	if a.pending.Swap(on) != on {
+		s.recompute()
+	}
+}
 
 // OnIntercept registers a callback fired whenever the answer to "does any
 // rule need packets to be held or dropped?" changes. Engines use it to switch
@@ -246,14 +304,31 @@ func (s *Shaper) App(id, name, path string) *App {
 	if a != nil {
 		return a
 	}
+	return s.AppWithParent(id, name, path, "")
+}
+
+// AppWithParent is App for a row split off from another app.
+func (s *Shaper) AppWithParent(id, name, path, parent string) *App {
 	s.appsMu.Lock()
-	defer s.appsMu.Unlock()
-	if a = s.apps[id]; a != nil {
+	if a := s.apps[id]; a != nil {
+		s.appsMu.Unlock()
 		return a
 	}
-	a = &App{ID: id, Name: name, Path: path}
+	a := &App{ID: id, Name: name, Path: path, Parent: parent}
 	s.apps[id] = a
+	s.appsMu.Unlock()
+	if s.onNewApp != nil {
+		s.onNewApp(a)
+	}
 	return a
+}
+
+// Remove forgets an app (used for per-process rows whose process is gone).
+func (s *Shaper) Remove(id string) {
+	s.appsMu.Lock()
+	delete(s.apps, id)
+	s.appsMu.Unlock()
+	s.recompute()
 }
 
 // Lookup returns the app with the given id, or nil.
@@ -289,13 +364,39 @@ func (s *Shaper) SetRule(a *App, r Rule) {
 		r.Quota.Bytes = 0
 	}
 	a.rule.Store(&r)
+	s.applySchedule(a, s.now())
 	s.recompute()
 }
 
 // ClearRule removes an app's rule.
 func (s *Shaper) ClearRule(a *App) {
 	a.rule.Store(nil)
+	a.eff.Store(nil)
 	s.recompute()
+}
+
+func (s *Shaper) applySchedule(a *App, now time.Time) bool {
+	r := a.rule.Load()
+	var want *Rule
+	if r != nil && r.Schedule.Active(now) && r.enforces() {
+		want = r
+	}
+	return a.eff.Swap(want) != want
+}
+
+// ApplySchedules switches rules on and off as their time windows open and
+// close. Call it every few seconds.
+func (s *Shaper) ApplySchedules() {
+	now := s.now()
+	changed := false
+	for _, a := range s.Apps() {
+		if s.applySchedule(a, now) {
+			changed = true
+		}
+	}
+	if changed {
+		s.recompute()
+	}
 }
 
 func (s *Shaper) recompute() {
@@ -303,7 +404,11 @@ func (s *Shaper) recompute() {
 	need := cfg.capRate(In) > 0 || cfg.capRate(Out) > 0
 	if !need {
 		for _, a := range s.Apps() {
-			r := a.rule.Load()
+			if a.pending.Load() {
+				need = true
+				break
+			}
+			r := a.eff.Load()
 			if r == nil {
 				continue
 			}
@@ -334,7 +439,7 @@ func prioOf(cfg *Config, a *App) int {
 	if !cfg.Priorities {
 		return PrioNormal
 	}
-	if r := a.rule.Load(); r != nil {
+	if r := a.eff.Load(); r != nil {
 		return r.Priority
 	}
 	return PrioNormal
@@ -380,10 +485,39 @@ func (s *Shaper) Count(a *App, d Dir, size int) {
 	a.used.Add(int64(size))
 }
 
+// AdmitVia is Admit for traffic that a website rule (via) shapes. The
+// process app's blocks, quota and pending state still apply, and its
+// counters still see the traffic; the speed limit comes from via.
+func (s *Shaper) AdmitVia(a, via *App, d Dir, size int) Verdict {
+	cfg := s.cfg.Load()
+	if a.pending.Load() {
+		a.dropped[d].Add(int64(size))
+		return Drop
+	}
+	if r := a.eff.Load(); r != nil {
+		if (cfg.Blocker && r.block(d)) || (r.Quota.On && r.Quota.Bytes > 0 && a.used.Load() >= r.Quota.Bytes) {
+			a.dropped[d].Add(int64(size))
+			return Drop
+		}
+	}
+	v := s.Admit(via, d, size)
+	switch v {
+	case Pass:
+		s.Count(a, d, size)
+	case Drop:
+		a.dropped[d].Add(int64(size))
+	}
+	return v
+}
+
 // Admit decides what happens to a packet of the given size.
 func (s *Shaper) Admit(a *App, d Dir, size int) Verdict {
 	cfg := s.cfg.Load()
-	r := a.rule.Load()
+	if a.pending.Load() {
+		a.dropped[d].Add(int64(size))
+		return Drop
+	}
+	r := a.eff.Load()
 	if r != nil {
 		if (cfg.Blocker && r.block(d)) ||
 			(r.Quota.On && r.Quota.Bytes > 0 && a.used.Load() >= r.Quota.Bytes) {
@@ -468,10 +602,20 @@ func (s *Shaper) Tick() {
 	s.mu.Unlock()
 	for _, p := range dead {
 		p.App.dropped[p.Dir].Add(int64(p.Size))
+		if p.Also != nil {
+			p.Also.dropped[p.Dir].Add(int64(p.Size))
+		}
 	}
 	for _, p := range out {
-		s.Count(p.App, p.Dir, p.Size)
+		s.countOut(p)
 		s.release(p)
+	}
+}
+
+func (s *Shaper) countOut(p *Packet) {
+	s.Count(p.App, p.Dir, p.Size)
+	if p.Also != nil {
+		s.Count(p.Also, p.Dir, p.Size)
 	}
 }
 
@@ -495,7 +639,7 @@ func (s *Shaper) drain(d Dir, cfg *Config, now time.Time, out, dead []*Packet) (
 			dead = append(dead, s.pop(a, d))
 		}
 		if capRate > 0 && a.q[d].len() > 0 && now.Sub(a.served[d]) > starvationGuard {
-			rate := appRate(cfg, a.rule.Load(), d)
+			rate := appRate(cfg, a.eff.Load(), d)
 			if rate > 0 {
 				s.refillApp(a, d, rate, now)
 				if a.tokens[d] <= 0 {
@@ -531,7 +675,7 @@ func (s *Shaper) drain(d Dir, cfg *Config, now time.Time, out, dead []*Packet) (
 				if a.q[d].len() == 0 {
 					continue
 				}
-				rate := appRate(cfg, a.rule.Load(), d)
+				rate := appRate(cfg, a.eff.Load(), d)
 				if rate > 0 {
 					s.refillApp(a, d, rate, now)
 					if a.tokens[d] <= 0 {
@@ -589,7 +733,7 @@ func (s *Shaper) FlushAll() {
 	}
 	s.mu.Unlock()
 	for _, p := range out {
-		s.Count(p.App, p.Dir, p.Size)
+		s.countOut(p)
 		s.release(p)
 	}
 }

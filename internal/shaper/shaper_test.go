@@ -236,3 +236,128 @@ func TestBigPacketsStillObeyLimit(t *testing.T) {
 	}
 	within(t, "big packets", float64(a.Passed(Out)), 2_000_000, 0.08)
 }
+
+func at(day time.Weekday, hh, mm int) time.Time {
+	// 2026-11-08 is a Sunday.
+	return time.Date(2026, 11, 8+int(day), hh, mm, 0, 0, time.Local)
+}
+
+func TestScheduleWindows(t *testing.T) {
+	week := [7]bool{false, true, true, true, true, true, false} // Mon-Fri
+	evening := Schedule{On: true, Days: week, From: 18 * 60, To: 23 * 60}
+	night := Schedule{On: true, Days: week, From: 22 * 60, To: 6 * 60}
+	allDay := Schedule{On: true, Days: [7]bool{true}, From: 0, To: 0}
+	cases := []struct {
+		name string
+		sc   Schedule
+		t    time.Time
+		want bool
+	}{
+		{"off always active", Schedule{}, at(time.Sunday, 3, 0), true},
+		{"evening inside", evening, at(time.Tuesday, 19, 30), true},
+		{"evening start inclusive", evening, at(time.Tuesday, 18, 0), true},
+		{"evening end exclusive", evening, at(time.Tuesday, 23, 0), false},
+		{"evening before", evening, at(time.Tuesday, 17, 59), false},
+		{"evening weekend", evening, at(time.Saturday, 19, 0), false},
+		{"night late friday", night, at(time.Friday, 23, 0), true},
+		{"night saturday early belongs to friday", night, at(time.Saturday, 2, 0), true},
+		{"night monday early belongs to sunday", night, at(time.Monday, 2, 0), false},
+		{"night saturday late", night, at(time.Saturday, 23, 0), false},
+		{"night midday", night, at(time.Wednesday, 12, 0), false},
+		{"all day sunday", allDay, at(time.Sunday, 13, 0), true},
+		{"all day monday", allDay, at(time.Monday, 13, 0), false},
+	}
+	for _, c := range cases {
+		if got := c.sc.Active(c.t); got != c.want {
+			t.Errorf("%s: got %v want %v", c.name, got, c.want)
+		}
+	}
+}
+
+func TestScheduledRuleSwitches(t *testing.T) {
+	m := newSim(t)
+	m.now = at(time.Tuesday, 17, 0)
+	a := m.s.App("a", "A", "")
+	m.s.SetRule(a, Rule{Priority: PrioNormal, BlockIn: true,
+		Schedule: Schedule{On: true, Days: [7]bool{false, true, true, true, true, true, false}, From: 18 * 60, To: 23 * 60}})
+	if a.InForce() || m.s.NeedsIntercept() {
+		t.Fatal("rule should be dormant before its window")
+	}
+	m.run(time.Second, &offer{app: a, dir: In, rate: 100_000})
+	if a.Passed(In) == 0 {
+		t.Fatal("traffic should pass outside the window")
+	}
+	m.now = at(time.Tuesday, 18, 30)
+	m.s.ApplySchedules()
+	if !a.InForce() || !m.s.NeedsIntercept() {
+		t.Fatal("rule should be in force inside its window")
+	}
+	before := a.Passed(In)
+	m.run(time.Second, &offer{app: a, dir: In, rate: 100_000})
+	if a.Passed(In) != before {
+		t.Fatal("blocked inside window")
+	}
+	if a.Rule().Schedule.From != 18*60 {
+		t.Fatal("configured rule must stay visible")
+	}
+}
+
+func TestPendingAppIsHeld(t *testing.T) {
+	m := newSim(t)
+	a := m.s.App("a", "A", "")
+	m.s.SetPending(a, true)
+	if !m.s.NeedsIntercept() {
+		t.Fatal("pending app needs intercept")
+	}
+	m.run(time.Second, &offer{app: a, dir: Out, rate: 100_000})
+	if a.Passed(Out) != 0 || a.Dropped(Out) == 0 {
+		t.Fatal("pending app must be held back")
+	}
+	m.s.SetPending(a, false)
+	m.run(time.Second, &offer{app: a, dir: Out, rate: 100_000})
+	if a.Passed(Out) == 0 {
+		t.Fatal("allowed app must pass")
+	}
+}
+
+func TestNewAppHook(t *testing.T) {
+	s := New(func(*Packet) {})
+	var got []string
+	s.OnNewApp(func(a *App) { got = append(got, a.ID) })
+	s.App("x", "X", "")
+	s.App("x", "X", "")
+	s.AppWithParent("pid:1", "X (1)", "", "x")
+	if len(got) != 2 || got[1] != "pid:1" {
+		t.Fatalf("hook calls: %v", got)
+	}
+	if s.Lookup("pid:1").Parent != "x" {
+		t.Fatal("parent not recorded")
+	}
+}
+
+func TestAdmitViaWebsiteRule(t *testing.T) {
+	m := newSim(t)
+	app := m.s.App("chrome", "Chrome", "")
+	site := m.s.App("site:yt", "YouTube", "")
+	m.s.SetRule(site, Rule{Priority: PrioNormal, LimitIn: Limit{On: true, Bps: 100_000}})
+	const pkt = 1400
+	for el := 0; el < 10_000; el++ {
+		m.now = m.now.Add(time.Millisecond)
+		if el%2 == 0 { // 700 KB/s offered
+			if m.s.AdmitVia(app, site, In, pkt) == Queue {
+				m.s.Enqueue(&Packet{App: site, Also: app, Dir: In, Size: pkt})
+			}
+		}
+		if el%2 == 1 {
+			m.s.Tick()
+		}
+	}
+	within(t, "site limited", float64(site.Passed(In)), 1_000_000, 0.06)
+	within(t, "app counted too", float64(app.Passed(In)), float64(site.Passed(In)), 0.001)
+
+	// A block on the app still wins over the website rule.
+	m.s.SetRule(app, Rule{Priority: PrioNormal, BlockIn: true})
+	if m.s.AdmitVia(app, site, In, pkt) != Drop {
+		t.Fatal("app block must apply to website-routed traffic")
+	}
+}
