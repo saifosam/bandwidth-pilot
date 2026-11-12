@@ -25,4 +25,18 @@ GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -H wi
   -o dist/BandwidthPilot/BandwidthPilot.exe ./cmd/bandwidthpilot
 cp third_party/windivert/WinDivert.dll third_party/windivert/WinDivert64.sys dist/BandwidthPilot/
 cp third_party/windivert/LICENSE.txt dist/BandwidthPilot/WinDivert-LICENSE.txt
-echo "done: dist/BandwidthPilot"
+VERSION=$(sed -n 's/^const version = "\(.*\)"/\1/p' cmd/bandwidthpilot/main.go)
+sed "s/{{VERSION}}/$VERSION/" installer/README.txt | sed 's/$/\r/' > dist/BandwidthPilot/README.txt
+echo "done: dist/BandwidthPilot ($VERSION)"
+
+# Release files: installer, portable zip and checksums.
+if command -v makensis >/dev/null; then
+  echo "== installer"
+  makensis -V2 -DVERSION="$VERSION" -DSRC=../dist/BandwidthPilot \
+    -DOUT="../dist/BandwidthPilot-$VERSION-setup.exe" installer/bandwidthpilot.nsi
+  (cd dist && rm -f "BandwidthPilot-$VERSION-portable.zip" && zip -q -r "BandwidthPilot-$VERSION-portable.zip" BandwidthPilot)
+  (cd dist && sha256sum "BandwidthPilot-$VERSION-setup.exe" "BandwidthPilot-$VERSION-portable.zip" > SHA256SUMS.txt)
+  echo "release files:"; ls -la dist/*.exe dist/*.zip dist/SHA256SUMS.txt
+else
+  echo "(install NSIS - apt install nsis - to also build the installer)"
+fi

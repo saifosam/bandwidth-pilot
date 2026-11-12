@@ -36,12 +36,17 @@ Written in Go. One 7 MB executable, no installer, no runtime to install.
   sign-in without a permission prompt.
 - **Usage history**: 30 days of per-app and per-day totals.
 
-## Running it
+## Installing
 
-1. Unzip the `Bandwidth Pilot` folder anywhere. Keep `WinDivert.dll` and
-   `WinDivert64.sys` next to `BandwidthPilot.exe`.
-2. Start `BandwidthPilot.exe` and accept the administrator prompt. Capturing packets
-   needs it.
+Download from [Releases](https://github.com/saifosam/bandwidth-pilot/releases/latest):
+
+- **`BandwidthPilot-x.y.z-setup.exe`** (recommended): installs to Program
+  Files, adds a Start menu entry and an uninstaller, and can start Bandwidth
+  Pilot with Windows.
+- **`BandwidthPilot-x.y.z-portable.zip`**: unzip anywhere and run
+  `BandwidthPilot.exe`. Keep `WinDivert.dll` and `WinDivert64.sys` next to it.
+
+Accept the administrator prompt when it starts; capturing packets needs it.
 
 Requirements: 64-bit Windows 10 or 11. The window uses the Edge WebView2
 runtime, which is part of Windows 11 and of most Windows 10 installs.
@@ -121,9 +126,17 @@ checked in, so Go is the only requirement.
 ```
 
 ```bash
-# Linux or macOS, cross-compiling for Windows
+# Linux or macOS, cross-compiling for Windows.
+# With NSIS installed (apt install nsis) this also builds the installer,
+# the portable zip and SHA256SUMS.txt in dist/.
 ./build.sh
 ```
+
+### Releasing
+
+1. Update `version` in `cmd/bandwidthpilot/main.go` and add a section to `CHANGELOG.md`.
+2. Commit, then tag and push: `git tag v0.3.0 && git push origin v0.3.0`.
+3. The Release workflow builds everything and publishes the GitHub release.
 
 Development without Windows:
 
@@ -170,11 +183,13 @@ internal/core/       service, rule and usage stores, prompts, log, RPC (+ tests)
 internal/ui/         embedded build of the interface
 ui/                  interface source (Preact)
 build/               icon, manifest, version resource
+installer/           NSIS installer script
+.github/workflows/   CI and the release workflow
 third_party/         WinDivert 2.2.2 binaries and licence
 ```
 
 ## Licences
 
-Bandwidth Pilot's own code is yours to license. WinDivert is LGPLv3 / GPLv2
+Bandwidth Pilot is MIT licensed (see `LICENSE`). WinDivert is LGPLv3 / GPLv2
 (`third_party/windivert/LICENSE.txt`); go-webview2 and go-winloader are MIT;
 golang.org/x/sys is BSD-3-Clause.

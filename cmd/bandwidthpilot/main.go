@@ -29,6 +29,8 @@ type options struct {
 func main() {
 	var o options
 	selftest := flag.Bool("selftest", false, "check the Windows plumbing and exit")
+	enableStartup := flag.Bool("enable-startup", false, "start with Windows (used by the installer) and exit")
+	disableStartup := flag.Bool("disable-startup", false, "stop starting with Windows (used by the uninstaller) and exit")
 	flag.BoolVar(&o.demo, "demo", false, "use simulated traffic instead of the real network")
 	flag.BoolVar(&o.serve, "serve", false, "serve the interface on localhost and open it in a browser instead of a window")
 	flag.IntVar(&o.port, "port", 0, "port for --serve (default: pick a free one)")
@@ -36,6 +38,14 @@ func main() {
 	flag.BoolVar(&o.debug, "debug", false, "enable the web inspector in the window")
 	flag.BoolVar(&o.tray, "tray", false, "start minimised to the notification area (used when starting with Windows)")
 	flag.Parse()
+
+	if *enableStartup || *disableStartup {
+		if err := setStartup(*enableStartup); err != nil {
+			fmt.Fprintln(os.Stderr, "bandwidthpilot:", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	dir := dataDir()
 	if o.demo {

@@ -1,0 +1,64 @@
+name: Release
+
+# Push a tag like v0.3.0 to build the installer, the portable zip and the
+# checksums and publish them as a GitHub release. The release notes are the
+# matching section of CHANGELOG.md.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install NSIS
+        run: sudo apt-get update -q && sudo apt-get install -y -q nsis zip
+
+      - name: Check the tag matches the app version
+        run: |
+          app=$(sed -n 's/^const version = "\(.*\)"/\1/p' cmd/bandwidthpilot/main.go)
+          if [ "v$app" != "$GITHUB_REF_NAME" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match the app version $app" >&2
+            exit 1
+          fi
+          echo "VERSION=$app" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: ./build.sh
+
+      - name: Release notes
+        run: |
+          awk -v v="## $VERSION" '
+            index($0, v) == 1 { on = 1; next }
+            on && /^## / { exit }
+            on { print }
+          ' CHANGELOG.md > notes.md
+          cat >> notes.md <<'NOTES'
+
+          ### Download
+          - **BandwidthPilot-VERSION-setup.exe**: installer (recommended). Adds a Start menu entry, an uninstaller and an option to start with Windows.
+          - **BandwidthPilot-VERSION-portable.zip**: no installation. Unzip anywhere and run `BandwidthPilot.exe`.
+
+          Needs 64-bit Windows 10 or 11 and administrator rights. Windows SmartScreen will warn that the app is not code-signed: choose **More info**, then **Run anyway**. Check downloads against `SHA256SUMS.txt`.
+          NOTES
+          sed -i "s/VERSION/$VERSION/g; s/^          //" notes.md
+          cat notes.md
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: Bandwidth Pilot ${{ env.VERSION }}
+          body_path: notes.md
+          files: |
+            dist/BandwidthPilot-${{ env.VERSION }}-setup.exe
+            dist/BandwidthPilot-${{ env.VERSION }}-portable.zip
+            dist/SHA256SUMS.txt
