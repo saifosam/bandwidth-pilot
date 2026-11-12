@@ -42,6 +42,7 @@ type held struct {
 
 type liveEngine struct {
 	s     *shaper.Shaper
+	opts  *Options
 	logf  Logf
 	flows *flowTable
 	ports *portTable
@@ -66,15 +67,18 @@ type liveEngine struct {
 }
 
 // NewLive returns the WinDivert engine.
-func NewLive(s *shaper.Shaper, logf Logf) (Engine, error) {
-	if logf == nil {
-		logf = func(string, ...any) {}
+func NewLive(s *shaper.Shaper, opts *Options) (Engine, error) {
+	if opts == nil {
+		opts = &Options{}
 	}
 	if err := wdLoad(); err != nil {
 		return nil, err
 	}
-	e := &liveEngine{s: s, logf: logf, flows: newFlowTable(), ports: newPortTable(),
+	e := &liveEngine{s: s, opts: opts, logf: opts.Logf, flows: newFlowTable(), ports: newPortTable(),
 		procs: newProcCache(s), icons: newIconCache()}
+	if e.logf == nil {
+		e.logf = func(string, ...any) {}
+	}
 	return e, nil
 }
 
@@ -249,6 +253,10 @@ func (e *liveEngine) handle(h uintptr, intercept bool, pkt []byte, addr *[wdAddr
 		k.lport, k.rport = info.sport, info.dport
 		remote = info.dst
 	}
+	// DNS answers tell us which website each address belongs to.
+	if !outbound && info.udp != nil && info.sport == 53 && e.opts.Sites != nil {
+		e.opts.Sites.Learn(info.udp)
+	}
 	ms := time.Now().UnixMilli()
 	f := e.flowFor(k, ms)
 	if f.remote.Load() == nil {
@@ -256,21 +264,38 @@ func (e *liveEngine) handle(h uintptr, intercept bool, pkt []byte, addr *[wdAddr
 	}
 	f.last.Store(ms)
 	app := f.app.Load()
+	via := e.opts.route(f, remote)
 	size := len(pkt)
+	// Log once the owner is known, or after a second if it never is.
+	logIt := !f.logged.Load() && (f.resolved.Load() || ms-f.born.Load() > 1000)
 
 	if !intercept {
 		e.s.Count(app, dir, size)
+		if via != nil {
+			e.s.Count(via, dir, size)
+		}
 		f.bytes[dir].Add(int64(size))
+		if logIt {
+			e.opts.logConn(f, app, via, remote, outbound, false)
+		}
 		return
 	}
-	switch e.s.Admit(app, dir, size) {
+	v := admit(e.s, app, via, dir, size)
+	if logIt {
+		e.opts.logConn(f, app, via, remote, outbound, v == shaper.Drop)
+	}
+	switch v {
 	case shaper.Pass:
 		wdSend(h, pkt, addr)
 		f.bytes[dir].Add(int64(size))
 	case shaper.Queue:
 		data := make([]byte, size)
 		copy(data, pkt)
-		e.s.Enqueue(&shaper.Packet{App: app, Dir: dir, Size: size, Data: data, Meta: &held{h: h, addr: *addr}})
+		p := &shaper.Packet{App: app, Dir: dir, Size: size, Data: data, Meta: &held{h: h, addr: *addr}}
+		if via != nil {
+			p.App, p.Also = via, app
+		}
+		e.s.Enqueue(p)
 		f.bytes[dir].Add(int64(size))
 	case shaper.Drop:
 	}
@@ -291,15 +316,30 @@ func (e *liveEngine) flowFor(k flowKey, ms int64) *flow {
 		return f
 	}
 	f := &flow{key: k}
+	f.born.Store(ms)
 	e.resolve(f, ms)
 	return e.flows.put(f)
+}
+
+// appFor maps a process id to its row, honouring per-process splitting.
+func (e *liveEngine) appFor(pid uint32) *shaper.App {
+	return e.opts.splitApp(e.s, e.procs.app(pid), pid)
+}
+
+// Resplit reattributes every flow after an app was split or merged.
+func (e *liveEngine) Resplit() {
+	e.flows.each(func(f *flow) {
+		if pid := f.pid.Load(); pid != 0 {
+			f.app.Store(e.appFor(pid))
+		}
+	})
 }
 
 // resolve finds the owning process of a flow through the port tables.
 func (e *liveEngine) resolve(f *flow, ms int64) {
 	if pid, ok := e.ports.lookup(f.key.proto, f.key.lport, f.key.rport); ok && pid != 0 {
 		f.pid.Store(pid)
-		f.app.Store(e.procs.app(pid))
+		f.app.Store(e.appFor(pid))
 		f.resolved.Store(true)
 		return
 	}
@@ -361,11 +401,13 @@ func (e *liveEngine) flowLoop() {
 			f := e.flows.get(k)
 			if f == nil {
 				f = &flow{key: k}
-				f.last.Store(time.Now().UnixMilli())
+				now := time.Now().UnixMilli()
+				f.last.Store(now)
+				f.born.Store(now)
 				f = e.flows.put(f)
 			}
 			f.pid.Store(pid)
-			f.app.Store(e.procs.app(pid))
+			f.app.Store(e.appFor(pid))
 			f.resolved.Store(true)
 			f.closed.Store(false)
 		case wdEventFlowDeleted:

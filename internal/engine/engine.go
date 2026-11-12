@@ -7,6 +7,7 @@
 package engine
 
 import (
+	"fmt"
 	"net/netip"
 	"sort"
 	"sync"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"bandwidthpilot/internal/shaper"
+	"bandwidthpilot/internal/sites"
 )
 
 // Conn is one connection as shown in the UI.
@@ -21,6 +23,7 @@ type Conn struct {
 	Proto      string `json:"proto"`
 	LocalPort  uint16 `json:"localPort"`
 	Remote     string `json:"remote"`
+	Host       string `json:"host"`
 	RemotePort uint16 `json:"remotePort"`
 	PID        uint32 `json:"pid"`
 	RateIn     int64  `json:"rateIn"`
@@ -55,6 +58,101 @@ type Engine interface {
 	Icon(appID string) string
 	// Windowed returns the ids of apps that currently show a window.
 	Windowed() map[string]bool
+	// Resplit reattributes traffic after an app is split into (or merged
+	// back from) one row per process.
+	Resplit()
+}
+
+// ConnEvent is one entry of the connection log.
+type ConnEvent struct {
+	Time     int64  `json:"time"` // unix milliseconds
+	AppID    string `json:"appId"`
+	App      string `json:"app"`
+	PID      uint32 `json:"pid"`
+	Proto    string `json:"proto"`
+	Remote   string `json:"remote"`
+	Host     string `json:"host"`
+	Port     uint16 `json:"port"`
+	Outbound bool   `json:"outbound"`
+	Blocked  bool   `json:"blocked"`
+	Site     string `json:"site"`
+}
+
+// Options connects an engine to the rest of the app.
+type Options struct {
+	Logf Logf
+	// Sites matches remote addresses to website rules; Match must return
+	// the rule's *shaper.App.
+	Sites *sites.Table
+	// Split reports whether an app is shown as one row per process.
+	Split func(appID string) bool
+	// OnConn receives the first packet of every new connection.
+	OnConn func(ConnEvent)
+}
+
+func (o *Options) logf(format string, args ...any) {
+	if o != nil && o.Logf != nil {
+		o.Logf(format, args...)
+	}
+}
+
+// splitApp returns the per-process row for pid when its app is split.
+func (o *Options) splitApp(s *shaper.Shaper, a *shaper.App, pid uint32) *shaper.App {
+	if o == nil || o.Split == nil || pid == 0 || a.Parent != "" || !o.Split(a.ID) {
+		return a
+	}
+	return s.AppWithParent(fmt.Sprintf("pid:%d:%s", pid, a.ID), fmt.Sprintf("%s (PID %d)", a.Name, pid), a.Path, a.ID)
+}
+
+// route returns the website rule app for a flow, or nil, caching the
+// answer until the rules or the DNS name change.
+func (o *Options) route(f *flow, remote netip.Addr) *shaper.App {
+	if o == nil || o.Sites == nil {
+		return nil
+	}
+	gen := o.Sites.Gen()
+	if f.viaGen.Load() == gen {
+		return f.via.Load()
+	}
+	host := o.Sites.Host(remote)
+	f.host.Store(&host)
+	var via *shaper.App
+	if m, ok := o.Sites.Match(remote).(*shaper.App); ok {
+		via = m
+	}
+	f.via.Store(via)
+	f.viaGen.Store(gen)
+	return via
+}
+
+// admit asks the shaper about one packet, through a website rule if any.
+func admit(s *shaper.Shaper, app, via *shaper.App, d shaper.Dir, size int) shaper.Verdict {
+	if via != nil {
+		return s.AdmitVia(app, via, d, size)
+	}
+	return s.Admit(app, d, size)
+}
+
+// logConn reports the first packet of a flow to the connection log.
+func (o *Options) logConn(f *flow, app, via *shaper.App, remote netip.Addr, outbound, blocked bool) {
+	if o == nil || o.OnConn == nil || f.logged.Swap(true) {
+		return
+	}
+	ev := ConnEvent{Time: time.Now().UnixMilli(), AppID: app.ID, App: app.Name, PID: f.pid.Load(),
+		Proto: "TCP", Port: f.key.rport, Outbound: outbound, Blocked: blocked}
+	if f.key.proto == protoUDP {
+		ev.Proto = "UDP"
+	}
+	if remote.IsValid() {
+		ev.Remote = remote.String()
+	}
+	if h := f.host.Load(); h != nil {
+		ev.Host = *h
+	}
+	if via != nil {
+		ev.Site = via.Name
+	}
+	o.OnConn(ev)
 }
 
 // AppProcs summarises an app's processes and connections.
@@ -86,6 +184,11 @@ type flow struct {
 	closed atomic.Bool
 
 	app      atomic.Pointer[shaper.App]
+	host     atomic.Pointer[string]
+	via      atomic.Pointer[shaper.App]
+	viaGen   atomic.Int64
+	logged   atomic.Bool
+	born     atomic.Int64 // unix ms of the first packet
 	pid      atomic.Uint32
 	resolved atomic.Bool
 	retryAt  atomic.Int64
@@ -158,12 +261,15 @@ func (t *flowTable) connections(appID string) []Conn {
 		if k.proto == protoUDP {
 			proto = "UDP"
 		}
-		remote := ""
+		remote, host := "", ""
 		if r := f.remote.Load(); r != nil {
 			remote = r.String()
 		}
+		if h := f.host.Load(); h != nil {
+			host = *h
+		}
 		out = append(out, Conn{
-			Proto: proto, LocalPort: k.lport, Remote: remote, RemotePort: k.rport,
+			Proto: proto, LocalPort: k.lport, Remote: remote, Host: host, RemotePort: k.rport,
 			PID: f.pid.Load(), RateIn: f.rate[0], RateOut: f.rate[1],
 			In: f.bytes[0].Load(), Out: f.bytes[1].Load(),
 		})
@@ -234,4 +340,14 @@ func (e *failedEngine) Housekeep()                   {}
 func (e *failedEngine) Connections(string) []Conn    { return nil }
 func (e *failedEngine) Summary() map[string]AppProcs { return nil }
 func (e *failedEngine) Icon(string) string           { return "" }
+func (e *failedEngine) Resplit()                     {}
 func (e *failedEngine) Windowed() map[string]bool    { return nil }
+
+// each calls fn for every tracked flow.
+func (t *flowTable) each(fn func(*flow)) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	for _, f := range t.m {
+		fn(f)
+	}
+}

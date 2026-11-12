@@ -9,6 +9,7 @@ type pktInfo struct {
 	dst   netip.Addr
 	sport uint16
 	dport uint16
+	udp   []byte // UDP payload, for reading DNS answers
 }
 
 // parsePacket reads the addresses, protocol and ports from a raw IPv4 or
@@ -69,5 +70,8 @@ func parsePacket(b []byte) (p pktInfo, ok bool) {
 	}
 	p.sport = uint16(l4[0])<<8 | uint16(l4[1])
 	p.dport = uint16(l4[2])<<8 | uint16(l4[3])
+	if p.proto == protoUDP && len(l4) > 8 {
+		p.udp = l4[8:]
+	}
 	return p, true
 }

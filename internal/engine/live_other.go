@@ -11,7 +11,7 @@ import (
 
 // NewLive returns the real packet engine for this OS. Only Windows has one
 // so far; a macOS engine (pf + dummynet, or a Network Extension) plugs in here.
-func NewLive(s *shaper.Shaper, logf Logf) (Engine, error) {
+func NewLive(s *shaper.Shaper, opts *Options) (Engine, error) {
 	return nil, errors.New("live traffic control is only available on Windows so far")
 }
 
