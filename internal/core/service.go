@@ -16,6 +16,7 @@ import (
 
 	"bandwidthpilot/internal/engine"
 	"bandwidthpilot/internal/shaper"
+	"bandwidthpilot/internal/sites"
 )
 
 // AppView is one row of the activity list.
@@ -36,6 +37,9 @@ type AppView struct {
 	DroppedIn  int64       `json:"droppedIn"`
 	DroppedOut int64       `json:"droppedOut"`
 	Online     bool        `json:"online"`
+	Parent     string      `json:"parent"`
+	Split      bool        `json:"split"`
+	InForce    bool        `json:"inForce"`
 	HasRule    bool        `json:"hasRule"`
 	QuotaHit   bool        `json:"quotaHit"`
 	Rule       shaper.Rule `json:"rule"`
@@ -56,6 +60,10 @@ type Snapshot struct {
 	TotalIn  int64         `json:"totalIn"`
 	TotalOut int64         `json:"totalOut"`
 	Seq      int64         `json:"seq"`
+	Ask      bool          `json:"ask"`
+	Pending  []Pending     `json:"pending"`
+	Sites    []SiteView    `json:"sites"`
+	LogSeq   int64         `json:"logSeq"`
 }
 
 type appStat struct {
@@ -69,6 +77,15 @@ type appStat struct {
 type Service struct {
 	S       *shaper.Shaper
 	Version string
+	Sites   *sites.Table
+	// Opts is what engines need to report connections and honour splits.
+	Opts *engine.Options
+	// OnPending is called (in a goroutine) when a new app waits for approval.
+	OnPending func(name string)
+	// Hooks are extra RPC methods supplied by the platform shell.
+	Hooks map[string]func(json.RawMessage) (any, error)
+
+	f features
 
 	mu         sync.Mutex
 	eng        engine.Engine
@@ -96,6 +113,9 @@ type savedRule struct {
 type savedState struct {
 	Config shaper.Config        `json:"config"`
 	Rules  map[string]savedRule `json:"rules"`
+	Ask    bool                 `json:"askNewApps"`
+	Split  []string             `json:"split"`
+	Sites  []sites.Site         `json:"sites"`
 	Prefs  json.RawMessage      `json:"prefs,omitempty"` // UI preferences, opaque to the backend
 }
 
@@ -108,7 +128,9 @@ func New(dir, version string, logf engine.Logf) *Service {
 	if host == "" {
 		host = "This PC"
 	}
-	sv := &Service{Version: version, stats: map[string]*appStat{}, lastWindow: map[string]time.Time{}, host: host, dir: dir, logf: logf}
+	sv := &Service{Version: version, stats: map[string]*appStat{}, lastWindow: map[string]time.Time{}, host: host, dir: dir, logf: logf,
+		Sites: sites.New(), f: newFeatures(), Hooks: map[string]func(json.RawMessage) (any, error){}}
+	sv.Opts = &engine.Options{Logf: logf, Sites: sv.Sites, Split: sv.isSplit, OnConn: sv.addLog}
 	sv.S = shaper.New(func(p *shaper.Packet) {
 		// The engine can be swapped at runtime, so look it up per call.
 		if e := sv.engine(); e != nil {
@@ -120,7 +142,9 @@ func New(dir, version string, logf engine.Logf) *Service {
 			e.SetIntercept(on)
 		}
 	})
+	sv.S.OnNewApp(sv.onNewApp)
 	sv.usage = loadUsage(filepath.Join(dir, "usage.json"))
+	sv.loadKnown()
 	sv.loadRules()
 	return sv
 }
@@ -145,6 +169,15 @@ func (sv *Service) loadRules() {
 	}
 	sv.S.SetConfig(st.Config)
 	sv.prefs = st.Prefs
+	sv.f.ask = st.Ask
+	for _, id := range st.Split {
+		sv.f.split[id] = true
+	}
+	sv.f.sites = st.Sites
+	for id := range st.Rules {
+		sv.f.known[id] = true // an app with a rule was approved long ago
+	}
+	sv.applySites()
 	for id, r := range st.Rules {
 		sv.S.SetRule(sv.S.App(id, r.Name, r.Path), r.Rule)
 	}
@@ -155,7 +188,18 @@ func (sv *Service) saveRules() {
 	prefs := sv.prefs
 	sv.mu.Unlock()
 	st := savedState{Config: sv.S.Config(), Rules: map[string]savedRule{}, Prefs: prefs}
+	sv.f.mu.Lock()
+	st.Ask = sv.f.ask
+	for id := range sv.f.split {
+		st.Split = append(st.Split, id)
+	}
+	sort.Strings(st.Split)
+	st.Sites = append([]sites.Site{}, sv.f.sites...)
+	sv.f.mu.Unlock()
 	for _, a := range sv.S.Apps() {
+		if a.Parent != "" {
+			continue // per-process rules last only while the process runs
+		}
 		if r := a.Rule(); !r.IsDefault() {
 			st.Rules[a.ID] = savedRule{Name: a.Name, Path: a.Path, Rule: r}
 		}
@@ -222,6 +266,7 @@ func (sv *Service) Run() {
 				sv.tick(now)
 				if n++; n%30 == 0 {
 					sv.usage.save()
+					sv.saveKnown()
 				}
 			}
 		}
@@ -239,6 +284,7 @@ func (sv *Service) Close() {
 		e.Stop()
 	}
 	sv.usage.save()
+	sv.saveKnown()
 	sv.saveRules()
 }
 
@@ -247,6 +293,7 @@ func (sv *Service) tick(now time.Time) {
 	if e := sv.engine(); e != nil {
 		e.Housekeep()
 	}
+	sv.S.ApplySchedules()
 	day := now.Format("2006-01-02")
 	rolled := sv.usage.roll(day)
 	apps := sv.S.Apps()
@@ -275,11 +322,22 @@ func (sv *Service) tick(now time.Time) {
 			delta[d] = cur - st.prev[d]
 			st.prev[d] = cur
 			st.rate[d] = delta[d]
-			sum[d] += delta[d]
+			if !strings.HasPrefix(a.ID, sitePrefix) {
+				sum[d] += delta[d]
+			}
 		}
 		if delta[0] > 0 || delta[1] > 0 {
 			st.lastActive = now
-			sv.usage.add(a.ID, a.Name, delta[0], delta[1])
+			switch {
+			case strings.HasPrefix(a.ID, sitePrefix):
+				// Website rules are counted on the Websites tab, not as apps.
+			case a.Parent != "":
+				if p := sv.S.Lookup(a.Parent); p != nil {
+					sv.usage.add(p.ID, p.Name, delta[0], delta[1])
+				}
+			default:
+				sv.usage.add(a.ID, a.Name, delta[0], delta[1])
+			}
 		}
 	}
 	for d := 0; d < 2; d++ {
@@ -330,7 +388,15 @@ func (sv *Service) Snapshot() Snapshot {
 	snap := Snapshot{Host: sv.host, OS: runtime.GOOS, Version: sv.Version, Engine: status, Config: sv.S.Config(),
 		RateIn: sv.rate[0], RateOut: sv.rate[1], PeakIn: sv.peak[0], PeakOut: sv.peak[1],
 		TotalIn: sv.total[0], TotalOut: sv.total[1], Seq: sv.seq}
+	snap.Pending = sv.pendingList()
+	snap.Sites = sv.siteViews()
+	sv.f.mu.Lock()
+	snap.Ask, snap.LogSeq = sv.f.ask, sv.f.logSeq
+	sv.f.mu.Unlock()
 	for _, a := range apps {
+		if strings.HasPrefix(a.ID, sitePrefix) {
+			continue
+		}
 		st := sv.stats[a.ID]
 		if st == nil {
 			st = &appStat{}
@@ -344,14 +410,26 @@ func (sv *Service) Snapshot() Snapshot {
 			TodayIn: tin, TodayOut: tout,
 			DroppedIn: a.Dropped(shaper.In), DroppedOut: a.Dropped(shaper.Out),
 			HasRule: !r.IsDefault(), QuotaHit: a.QuotaExceeded(), Rule: r}
-		v.Window = windowed[a.ID]
-		v.Kind = sv.kindOf(a, v.Window)
+		v.Parent = a.Parent
+		v.InForce = a.InForce()
+		if a.Parent != "" {
+			// A process row belongs wherever its app does.
+			if p := sv.S.Lookup(a.Parent); p != nil {
+				v.Window = windowed[p.ID]
+				v.Kind = sv.kindOf(p, v.Window)
+			}
+		} else {
+			v.Split = sv.isSplit(a.ID)
+			v.Window = windowed[a.ID]
+			v.Kind = sv.kindOf(a, v.Window)
+		}
 		v.Online = p.Conns > 0 || (!st.lastActive.IsZero() && now.Sub(st.lastActive) < 60*time.Second)
 		if v.PIDs == nil {
 			v.PIDs = []uint32{}
 		}
-		// Apps that are gone and have no rule drop off the list.
-		if !v.Online && !v.HasRule && v.TotalIn+v.TotalOut == 0 {
+		// Apps that are gone and have no rule drop off the list; so do
+		// process rows whose process has ended.
+		if !v.Online && !v.HasRule && (v.TotalIn+v.TotalOut == 0 || v.Parent != "") {
 			continue
 		}
 		snap.Apps = append(snap.Apps, v)
@@ -370,6 +448,10 @@ func (sv *Service) Call(method string, params json.RawMessage) (any, error) {
 		Rule   *shaper.Rule    `json:"rule"`
 		Config *shaper.Config  `json:"config"`
 		Prefs  json.RawMessage `json:"prefs"`
+		On     bool            `json:"on"`
+		Allow  bool            `json:"allow"`
+		Since  int64           `json:"since"`
+		Site   *sites.Site     `json:"site"`
 	}
 	if len(params) > 0 && string(params) != "null" {
 		if err := json.Unmarshal(params, &p); err != nil {
@@ -416,7 +498,9 @@ func (sv *Service) Call(method string, params json.RawMessage) (any, error) {
 
 	case "clearAllRules":
 		for _, a := range sv.S.Apps() {
-			sv.S.ClearRule(a)
+			if !strings.HasPrefix(a.ID, sitePrefix) {
+				sv.S.ClearRule(a)
+			}
 		}
 		sv.saveRules()
 		return sv.Snapshot(), nil
@@ -461,10 +545,49 @@ func (sv *Service) Call(method string, params json.RawMessage) (any, error) {
 		return nil, nil
 
 	case "useDemo":
-		if err := sv.UseEngine(engine.NewDemo(sv.S)); err != nil {
+		if err := sv.UseEngine(engine.NewDemo(sv.S, sv.Opts)); err != nil {
 			return nil, err
 		}
 		return sv.Snapshot(), nil
+
+	case "log":
+		return sv.logSince(p.Since), nil
+
+	case "decide":
+		if err := sv.decide(p.ID, p.Allow); err != nil {
+			return nil, err
+		}
+		return sv.Snapshot(), nil
+
+	case "setAsk":
+		sv.setAsk(p.On)
+		return sv.Snapshot(), nil
+
+	case "setSplit":
+		if sv.S.Lookup(p.ID) == nil {
+			return nil, errors.New("unknown app")
+		}
+		sv.setSplit(p.ID, p.On)
+		return sv.Snapshot(), nil
+
+	case "sitePresets":
+		return sites.Presets, nil
+
+	case "setSite":
+		if p.Site == nil || p.Rule == nil {
+			return nil, errors.New("missing website rule")
+		}
+		if err := sv.setSite(*p.Site, *p.Rule); err != nil {
+			return nil, err
+		}
+		return sv.Snapshot(), nil
+
+	case "deleteSite":
+		sv.deleteSite(p.ID)
+		return sv.Snapshot(), nil
+	}
+	if h := sv.Hooks[method]; h != nil {
+		return h(params)
 	}
 	return nil, fmt.Errorf("unknown method %q", method)
 }
