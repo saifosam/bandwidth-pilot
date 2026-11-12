@@ -5,6 +5,7 @@ import { fmtRate, fmtBytes, hueOf, PRIORITIES, KB, MB } from './format.js';
 import { Icon, Logo } from './icons.jsx';
 import { Switch, Segmented, RateField, SizeField } from './controls.jsx';
 import { Sparkline, RateChart, UsageBars } from './charts.jsx';
+import { ScheduleEditor, PendingCards, ConnectionsTab, WebsitesTab, WindowSettings, scheduleText, daysText, fmtTime } from './features.jsx';
 
 const HOST = '__host';
 const GROUPS = [
@@ -48,6 +49,10 @@ function RuleBadges({ app, config, units }) {
   if (r.limitIn.on) out.push(<span class={'badge' + (config.limiter ? '' : ' off')} title={'Download limit' + (config.limiter ? '' : ' (Limiter is switched off)')}><Icon name="down" size={12} />{fmtRate(r.limitIn.bps, units)}</span>);
   if (r.limitOut.on) out.push(<span class={'badge' + (config.limiter ? '' : ' off')} title={'Upload limit' + (config.limiter ? '' : ' (Limiter is switched off)')}><Icon name="up" size={12} />{fmtRate(r.limitOut.bps, units)}</span>);
   if (r.priority !== 1) out.push(<span class={'badge' + (config.priorities ? '' : ' off')} title={'Priority' + (config.priorities ? '' : ' (Priorities are switched off)')}><Icon name="flag" size={12} />{PRIORITIES[r.priority]}</span>);
+  if (r.schedule && r.schedule.on) {
+    out.push(<span class={'badge' + (app.inForce ? '' : ' off soft')} title={(app.inForce ? 'In force now: ' : 'Not in force right now: ') + scheduleText(r.schedule)}>
+      <Icon name="clock" size={12} />{r.schedule.from === r.schedule.to ? daysText(r.schedule.days) : `${fmtTime(r.schedule.from)}–${fmtTime(r.schedule.to)}`}</span>);
+  }
   if (r.quota.on) {
     const pct = Math.min(100, Math.round(((app.todayIn + app.todayOut) / Math.max(1, r.quota.bytes)) * 100));
     out.push(<span class={'badge' + (app.quotaHit ? ' danger' : '')} title="Daily data quota"><Icon name="quota" size={12} />{app.quotaHit ? 'Quota reached' : pct + '% of quota'}</span>);
@@ -83,8 +88,24 @@ function Activity({ snap, view, setView, selected, setSelected, expanded, toggle
   const { filter, sort, search, group } = view;
   const [closed, setClosed] = useState(() => new Set());
   const q = search.trim().toLowerCase();
+  const children = useMemo(() => {
+    const m = new Map();
+    for (const a of snap.apps) {
+      if (!a.parent) continue;
+      if (!m.has(a.parent)) m.set(a.parent, []);
+      m.get(a.parent).push(a);
+    }
+    for (const list of m.values()) list.sort((a, b) => (b.rateIn + b.rateOut) - (a.rateIn + a.rateOut) || a.name.localeCompare(b.name));
+    return m;
+  }, [snap]);
   const rows = useMemo(() => {
-    let list = snap.apps.filter((a) => {
+    const tops = snap.apps.filter((a) => !a.parent).map((a) => {
+      const kids = children.get(a.id);
+      if (!kids) return a;
+      return { ...a, rateIn: a.rateIn + kids.reduce((n, k) => n + k.rateIn, 0), rateOut: a.rateOut + kids.reduce((n, k) => n + k.rateOut, 0),
+        online: a.online || kids.some((k) => k.online), hasRule: a.hasRule || kids.some((k) => k.hasRule) };
+    });
+    let list = tops.filter((a) => {
       if (q && !a.name.toLowerCase().includes(q) && !a.path.toLowerCase().includes(q)) return false;
       if (filter === 'online') return a.online;
       if (filter === 'offline') return !a.online;
@@ -100,7 +121,7 @@ function Activity({ snap, view, setView, selected, setSelected, expanded, toggle
       return a.name.localeCompare(b.name);
     });
     return list;
-  }, [snap, filter, sort, q]);
+  }, [snap, children, filter, sort, q]);
 
   const sections = group
     ? GROUPS.map((g) => ({ ...g, rows: rows.filter((a) => a.kind === g.kind) })).filter((g) => g.rows.length)
@@ -110,6 +131,52 @@ function Activity({ snap, view, setView, selected, setSelected, expanded, toggle
     if (n.has(kind)) n.delete(kind); else n.add(kind);
     return n;
   });
+
+  const renderRow = (a, child) => {
+    const open = expanded.has(a.id);
+    const idle = a.rateIn + a.rateOut === 0;
+    const h = hist.get(a.id);
+    const blocked = a.rule.blockIn && a.rule.blockOut;
+    return (
+      <div key={a.id}>
+        <div class={'row' + (child ? ' child' : '') + (selected === a.id ? ' selected' : '') + (a.online ? '' : ' offline') + (a.hasRule && !a.inForce && a.rule.schedule && a.rule.schedule.on ? ' dormant' : '')}
+          role="option" aria-selected={selected === a.id}
+          onClick={() => setSelected(a.id)}
+          onContextMenu={(e) => { e.preventDefault(); setSelected(a.id); onMenu({ x: e.clientX, y: e.clientY, id: a.id }); }}>
+          <span class="c-name">
+            <button type="button" class={'twisty' + (open ? ' open' : '')} aria-label={open ? 'Hide connections' : 'Show connections'}
+              onClick={(e) => { e.stopPropagation(); toggleExpand(a.id); }}>
+              <Icon name="chevron" size={12} />
+            </button>
+            {child ? <span class="procicon"><Icon name="split" size={13} /></span> : <AppIcon app={a} icons={icons} />}
+            <span class="name" title={a.path || a.name}>{a.name}</span>
+            {a.split && <span class="gcount" title="Shown per process">{(children.get(a.id) || []).length} processes</span>}
+          </span>
+          <span class={'c-num dl' + (a.rateIn === 0 ? ' zero' : '')}>{fmtRate(a.rateIn, units)}</span>
+          <span class={'c-num ul' + (a.rateOut === 0 ? ' zero' : '')}>{fmtRate(a.rateOut, units)}</span>
+          <span class={'c-spark' + (idle ? ' zero' : '')}><Sparkline data={h && h.sum} /></span>
+          <span class="c-rules">
+            <RuleBadges app={a} config={snap.config} units={units} />
+            <span class="quick">
+              <button type="button" title={a.rule.limitIn.on ? 'Remove download limit' : 'Limit download'} class={a.rule.limitIn.on ? 'on' : ''}
+                onClick={(e) => { e.stopPropagation(); onRule(a, { limitIn: { on: !a.rule.limitIn.on, bps: a.rule.limitIn.bps || DEFAULT_LIMIT } }); }}>
+                <Icon name="down" size={14} />
+              </button>
+              <button type="button" title={a.rule.limitOut.on ? 'Remove upload limit' : 'Limit upload'} class={a.rule.limitOut.on ? 'on' : ''}
+                onClick={(e) => { e.stopPropagation(); onRule(a, { limitOut: { on: !a.rule.limitOut.on, bps: a.rule.limitOut.bps || DEFAULT_LIMIT } }); }}>
+                <Icon name="up" size={14} />
+              </button>
+              <button type="button" title={blocked ? 'Unblock' : 'Block all traffic'} class={blocked ? 'on danger' : ''}
+                onClick={(e) => { e.stopPropagation(); onRule(a, { blockIn: !blocked, blockOut: !blocked }); }}>
+                <Icon name="block" size={14} />
+              </button>
+            </span>
+          </span>
+        </div>
+        {open && <ConnRows list={conns.get(a.id)} units={units} />}
+      </div>
+    );
+  };
 
   const head = (key, label, cls) => (
     <button type="button" class={'th ' + cls + (sort.key === key ? ' sorted' : '')}
@@ -174,50 +241,7 @@ function Activity({ snap, view, setView, selected, setSelected, expanded, toggle
                 <span class="c-rules" />
               </div>
             ),
-            ...(open ? sec.rows.map((a) => {
-          const open = expanded.has(a.id);
-          const idle = a.rateIn + a.rateOut === 0;
-          const h = hist.get(a.id);
-          const blocked = a.rule.blockIn && a.rule.blockOut;
-          return (
-            <div key={a.id}>
-              <div class={'row' + (selected === a.id ? ' selected' : '') + (a.online ? '' : ' offline')}
-                role="option" aria-selected={selected === a.id}
-                onClick={() => setSelected(a.id)}
-                onContextMenu={(e) => { e.preventDefault(); setSelected(a.id); onMenu({ x: e.clientX, y: e.clientY, id: a.id }); }}>
-                <span class="c-name">
-                  <button type="button" class={'twisty' + (open ? ' open' : '')} aria-label={open ? 'Hide connections' : 'Show connections'}
-                    onClick={(e) => { e.stopPropagation(); toggleExpand(a.id); }}>
-                    <Icon name="chevron" size={12} />
-                  </button>
-                  <AppIcon app={a} icons={icons} />
-                  <span class="name" title={a.path || a.name}>{a.name}</span>
-                </span>
-                <span class={'c-num dl' + (a.rateIn === 0 ? ' zero' : '')}>{fmtRate(a.rateIn, units)}</span>
-                <span class={'c-num ul' + (a.rateOut === 0 ? ' zero' : '')}>{fmtRate(a.rateOut, units)}</span>
-                <span class={'c-spark' + (idle ? ' zero' : '')}><Sparkline data={h && h.sum} /></span>
-                <span class="c-rules">
-                  <RuleBadges app={a} config={snap.config} units={units} />
-                  <span class="quick">
-                    <button type="button" title={a.rule.limitIn.on ? 'Remove download limit' : 'Limit download'} class={a.rule.limitIn.on ? 'on' : ''}
-                      onClick={(e) => { e.stopPropagation(); onRule(a, { limitIn: { on: !a.rule.limitIn.on, bps: a.rule.limitIn.bps || DEFAULT_LIMIT } }); }}>
-                      <Icon name="down" size={14} />
-                    </button>
-                    <button type="button" title={a.rule.limitOut.on ? 'Remove upload limit' : 'Limit upload'} class={a.rule.limitOut.on ? 'on' : ''}
-                      onClick={(e) => { e.stopPropagation(); onRule(a, { limitOut: { on: !a.rule.limitOut.on, bps: a.rule.limitOut.bps || DEFAULT_LIMIT } }); }}>
-                      <Icon name="up" size={14} />
-                    </button>
-                    <button type="button" title={blocked ? 'Unblock' : 'Block all traffic'} class={blocked ? 'on danger' : ''}
-                      onClick={(e) => { e.stopPropagation(); onRule(a, { blockIn: !blocked, blockOut: !blocked }); }}>
-                      <Icon name="block" size={14} />
-                    </button>
-                  </span>
-                </span>
-              </div>
-              {open && <ConnRows list={conns.get(a.id)} units={units} />}
-            </div>
-          );
-        }) : []),
+            ...(open ? sec.rows.flatMap((a) => [renderRow(a, false), ...(a.split ? (children.get(a.id) || []).map((k) => renderRow(k, true)) : [])]) : []),
           ];
         })}
         {rows.length === 0 && <div class="empty">{q ? `Nothing matches "${search}".` : 'No apps in this view.'}</div>}
@@ -233,7 +257,7 @@ function ConnRows({ list, units }) {
     <div class="row conn">
       <span class="c-name">
         <span class="proto">{c.proto}</span>
-        <span class="addr">{c.remote ? (c.remote.includes(':') ? `[${c.remote}]` : c.remote) : 'unknown'}:{c.remotePort}</span>
+        <span class="addr" title={c.remote}>{c.host || (c.remote ? (c.remote.includes(':') ? `[${c.remote}]` : c.remote) : 'unknown')}:{c.remotePort}</span>
         <span class="dim">local port {c.localPort}{c.pid ? ` · PID ${c.pid}` : ''}</span>
       </span>
       <span class={'c-num' + (c.rateIn === 0 ? ' zero' : '')}>{fmtRate(c.rateIn, units)}</span>
@@ -303,7 +327,7 @@ function HostInfo({ snap, hist, units, onConfig }) {
   );
 }
 
-function AppInfo({ app, snap, hist, conns, icons, units, onRule, onClear, onReveal }) {
+function AppInfo({ app, snap, hist, conns, icons, units, onRule, onClear, onReveal, onSplit }) {
   const r = app.rule;
   const cfg = snap.config;
   const used = app.todayIn + app.todayOut;
@@ -386,7 +410,19 @@ function AppInfo({ app, snap, hist, conns, icons, units, onRule, onClear, onReve
             </div>
           </div>
         )}
+        <ScheduleEditor rule={r} inForce={app.inForce} onRule={(patch) => onRule(app, patch)} />
+        {app.parent && <div class="hint pad">This rule applies to this one process and ends when it closes.</div>}
       </div>
+
+      {!app.parent && (
+        <div class="card">
+          <div class="rule first">
+            <span class="rule-name tall">Show each process separately
+              <small>Give each running copy of {app.name} its own row and its own rules.</small></span>
+            <Switch checked={app.split} onChange={(v) => onSplit(app, v)} />
+          </div>
+        </div>
+      )}
 
       <div class="stats">
         <Stat label="Downloaded" value={fmtBytes(app.totalIn)} sub="this session" />
@@ -403,7 +439,7 @@ function AppInfo({ app, snap, hist, conns, icons, units, onRule, onClear, onReve
           {conns.slice(0, 6).map((c) => (
             <div class="conn-line">
               <span class="proto">{c.proto}</span>
-              <span class="grow ellip">{c.remote || 'unknown'}:{c.remotePort}</span>
+              <span class="grow ellip" title={c.remote}>{c.host || c.remote || 'unknown'}:{c.remotePort}</span>
               <span class="num dl">{fmtRate(c.rateIn, units)}</span>
               <span class="num ul">{fmtRate(c.rateOut, units)}</span>
             </div>
@@ -505,13 +541,20 @@ function UsageTab({ onReset }) {
   );
 }
 
-function SettingsTab({ snap, units, setUnits, onConfig }) {
+function SettingsTab({ snap, units, setUnits, onConfig, onAsk }) {
   const c = snap.config;
   const e = snap.engine;
   return (
     <div class="page narrow">
       <div class="page-head"><div><h2>Settings</h2></div></div>
       <CapEditor config={c} snap={snap} onConfig={onConfig} units={units} />
+      <div class="card">
+        <div class="card-head"><div class="card-title">New apps</div></div>
+        <div class="rule"><span class="rule-name tall">Ask before new apps connect
+          <small>The first time an app you have not used before goes online, its traffic is held until you allow or block it. Apps already seen and parts of Windows are not asked about.</small></span>
+          <Switch checked={snap.ask} onChange={onAsk} /></div>
+      </div>
+      <WindowSettings />
       <div class="card">
         <div class="card-head"><div class="card-title">Master switches</div></div>
         <div class="rule"><span class="rule-name tall">Blocker<small>Apply block rules.</small></span><Switch checked={c.blocker} onChange={(v) => onConfig({ blocker: v })} /></div>
@@ -544,7 +587,7 @@ function SettingsTab({ snap, units, setUnits, onConfig }) {
 }
 
 // Right-click menu for an app row.
-function ContextMenu({ menu, app, onRule, onClear, onReveal, onClose, live }) {
+function ContextMenu({ menu, app, onRule, onClear, onReveal, onSplit, onClose, live }) {
   const ref = useRef(null);
   const [pos, setPos] = useState({ left: menu.x, top: menu.y });
   useEffect(() => {
@@ -592,6 +635,11 @@ function ContextMenu({ menu, app, onRule, onClear, onReveal, onClose, live }) {
       <button type="button" class="menu-item" role="menuitem" disabled={!app.hasRule} onClick={() => { onClear(app); onClose(); }}>
         <Icon name="trash" size={14} />Remove all rules
       </button>
+      {!app.parent && (
+        <button type="button" class="menu-item" role="menuitem" onClick={() => { onSplit(app, !app.split); onClose(); }}>
+          <Icon name="split" size={14} />{app.split ? 'Show as one row' : 'Show each process separately'}
+        </button>
+      )}
       {live && app.path && (
         <button type="button" class="menu-item" role="menuitem" onClick={() => { onReveal(app); onClose(); }}>
           <Icon name="folder" size={14} />Open file location
@@ -643,7 +691,16 @@ function App() {
       };
       push(HOST, s.rateIn, s.rateOut);
       const live = new Set([HOST]);
-      for (const a of s.apps) { push(a.id, a.rateIn, a.rateOut); live.add(a.id); }
+      const kid = new Map();
+      for (const a of s.apps) if (a.parent) {
+        const k = kid.get(a.parent) || [0, 0];
+        kid.set(a.parent, [k[0] + a.rateIn, k[1] + a.rateOut]);
+      }
+      for (const a of s.apps) {
+        const k = kid.get(a.id) || [0, 0];
+        push(a.id, a.rateIn + k[0], a.rateOut + k[1]);
+        live.add(a.id);
+      }
       for (const id of hist.current.keys()) if (!live.has(id)) hist.current.delete(id);
     }
     if (s.engine.mode === 'live') {
@@ -696,6 +753,7 @@ function App() {
   const onClear = (app) => apply(call('clearRule', { id: app.id }));
   const onClearAll = () => apply(call('clearAllRules'));
   const onConfig = (patch) => apply(call('setConfig', { config: { ...snap.config, ...patch } }));
+  const onSplit = (app, on) => apply(call('setSplit', { id: app.id, on }));
   const onReveal = (app) => call('reveal', { id: app.id }).catch(() => {});
   const toggleExpand = (id) => setExpanded((s) => {
     const n = new Set(s);
@@ -723,7 +781,7 @@ function App() {
           <span>Bandwidth Pilot</span>
         </div>
         <nav class="tabs" role="tablist">
-          {[['activity', 'Activity'], ['rules', 'Rules'], ['usage', 'Usage'], ['settings', 'Settings']].map(([id, label]) => (
+          {[['activity', 'Activity'], ['connections', 'Connections'], ['websites', 'Websites'], ['rules', 'Rules'], ['usage', 'Usage'], ['settings', 'Settings']].map(([id, label]) => (
             <button type="button" role="tab" aria-selected={tab === id} class={tab === id ? 'on' : ''} onClick={() => setTab(id)}>
               {label}{id === 'rules' && snap.apps.some((a) => a.hasRule) && <span class="count">{snap.apps.filter((a) => a.hasRule).length}</span>}
             </button>
@@ -766,13 +824,16 @@ function App() {
           {tab === 'rules' && <RulesTab snap={snap} icons={icons.current} units={units} onClear={onClear} onClearAll={onClearAll}
             onEdit={(a) => { select(a.id); setTab('activity'); }} />}
           {tab === 'usage' && <UsageTab onReset={() => call('resetUsage')} />}
-          {tab === 'settings' && <SettingsTab snap={snap} units={units} setUnits={setUnits} onConfig={onConfig} />}
+          {tab === 'connections' && <ConnectionsTab search={view.search} onPickApp={(id) => { select(id); setTab('activity'); }} />}
+          {tab === 'websites' && <WebsitesTab snap={snap} units={units} apply={apply} />}
+          {tab === 'settings' && <SettingsTab snap={snap} units={units} setUnits={setUnits} onConfig={onConfig}
+            onAsk={(v) => apply(call('setAsk', { on: v }))} />}
         </main>
         {tab === 'activity' && (
           <aside class="info" aria-label="Details">
             {sel
               ? <AppInfo key={sel.id} app={sel} snap={snap} hist={hist.current} conns={conns.get(sel.id)} icons={icons.current}
-                  units={units} onRule={onRule} onClear={onClear} onReveal={onReveal} />
+                  units={units} onRule={onRule} onClear={onClear} onReveal={onReveal} onSplit={onSplit} />
               : <HostInfo snap={snap} hist={hist.current} units={units} onConfig={onConfig} />}
           </aside>
         )}
@@ -791,8 +852,10 @@ function App() {
         <span class="dim">Session {fmtBytes(snap.totalIn)} down, {fmtBytes(snap.totalOut)} up</span>
       </footer>
 
+      <PendingCards pending={snap.pending} apply={apply} />
+
       {menu && menuApp && (
-        <ContextMenu menu={menu} app={menuApp} live={e.mode === 'live'} onRule={onRule} onClear={onClear} onReveal={onReveal} onClose={() => setMenu(null)} />
+        <ContextMenu menu={menu} app={menuApp} live={e.mode === 'live'} onRule={onRule} onClear={onClear} onReveal={onReveal} onSplit={onSplit} onClose={() => setMenu(null)} />
       )}
     </div>
   );

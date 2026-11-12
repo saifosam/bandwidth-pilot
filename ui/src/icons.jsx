@@ -13,6 +13,12 @@ const PATHS = {
   trash: 'M2.8 4.4h10.4M6.4 4.4V2.8h3.2v1.6M4.2 4.4l.6 9h6.4l.6-9',
   info: 'M8 14A6 6 0 1 0 8 2a6 6 0 0 0 0 12zM8 7.2v4M8 4.9v.2',
   check: 'M3.2 8.4l3.2 3.2 6.4-7',
+  clock: 'M8 14A6 6 0 1 0 8 2a6 6 0 0 0 0 12zM8 4.6V8l2.4 1.6',
+  globe: 'M8 14A6 6 0 1 0 8 2a6 6 0 0 0 0 12zM2 8h12M8 2c1.8 1.8 2.6 3.8 2.6 6S9.8 12.2 8 14M8 2C6.2 3.8 5.4 5.8 5.4 8S6.2 12.2 8 14',
+  list: 'M5.5 4h8.5M5.5 8h8.5M5.5 12h8.5M2.2 4h.3M2.2 8h.3M2.2 12h.3',
+  shield: 'M8 14s5-2.2 5-6.4V3.6L8 2 3 3.6v4c0 4.2 5 6.4 5 6.4z',
+  split: 'M3 3h4v4H3zM9 9h4v4H9zM5 7v4h4',
+  plus: 'M8 3v10M3 8h10',
 };
 
 export function Icon({ name, size = 16, class: cls = '' }) {
