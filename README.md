@@ -135,8 +135,9 @@ checked in, so Go is the only requirement.
 ### Releasing
 
 1. Update `version` in `cmd/bandwidthpilot/main.go` and add a section to `CHANGELOG.md`.
-2. Commit, then tag and push: `git tag v0.3.0 && git push origin v0.3.0`.
-3. The Release workflow builds everything and publishes the GitHub release.
+2. Commit and push to `main`. The Release workflow sees a version with no
+   release yet, builds everything, creates the `vX.Y.Z` tag and publishes
+   the release. (Pushing a `vX.Y.Z` tag yourself works too.)
 
 Development without Windows:
 

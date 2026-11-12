@@ -1,11 +1,18 @@
 name: Release
 
-# Push a tag like v0.3.0 to build the installer, the portable zip and the
-# checksums and publish them as a GitHub release. The release notes are the
-# matching section of CHANGELOG.md.
+# Builds the installer, the portable zip and the checksums and publishes them
+# as a GitHub release, with notes from the matching section of CHANGELOG.md.
+#
+# It runs when:
+#   - main gets a version number (cmd/bandwidthpilot/main.go) that has no
+#     release yet; the release creates the vX.Y.Z tag, or
+#   - a vX.Y.Z tag is pushed, or
+#   - it is started by hand from the Actions tab.
 on:
   push:
+    branches: [main]
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -21,22 +28,32 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: Install NSIS
-        run: sudo apt-get update -q && sudo apt-get install -y -q nsis zip
-
-      - name: Check the tag matches the app version
+      - name: Work out the version
+        id: ver
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           app=$(sed -n 's/^const version = "\(.*\)"/\1/p' cmd/bandwidthpilot/main.go)
-          if [ "v$app" != "$GITHUB_REF_NAME" ]; then
+          echo "VERSION=$app" >> "$GITHUB_ENV"
+          if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "v$app" != "$GITHUB_REF_NAME" ]; then
             echo "Tag $GITHUB_REF_NAME does not match the app version $app" >&2
             exit 1
           fi
-          echo "VERSION=$app" >> "$GITHUB_ENV"
+          if gh release view "v$app" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release v$app already exists; nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install NSIS
+        if: steps.ver.outputs.skip != 'true'
+        run: sudo apt-get update -q && sudo apt-get install -y -q nsis zip
 
       - name: Build
+        if: steps.ver.outputs.skip != 'true'
         run: ./build.sh
 
       - name: Release notes
+        if: steps.ver.outputs.skip != 'true'
         run: |
           awk -v v="## $VERSION" '
             index($0, v) == 1 { on = 1; next }
@@ -55,7 +72,10 @@ jobs:
           cat notes.md
 
       - uses: softprops/action-gh-release@v2
+        if: steps.ver.outputs.skip != 'true'
         with:
+          tag_name: v${{ env.VERSION }}
+          target_commitish: ${{ github.sha }}
           name: Bandwidth Pilot ${{ env.VERSION }}
           body_path: notes.md
           files: |
