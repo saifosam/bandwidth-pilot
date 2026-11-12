@@ -10,20 +10,31 @@ Written in Go. One 7 MB executable, no installer, no runtime to install.
 
 ## Features
 
-- **Grouped like Task Manager**: Apps (have a window), Background processes
-  (tray apps, updaters, helpers) and Windows processes, each collapsible with
-  group totals. Turn grouping off for one flat list.
 - **Live activity** for every app: download and upload speed, a one-minute
-  trace, open connections (remote address, port, process id), session totals.
+  trace, open connections with the website names they belong to.
+- **Grouped like Task Manager**: Apps (have a window), Background processes
+  and Windows processes, each collapsible with group totals.
 - **Speed limits** per app, separately for download and upload.
 - **Blocker**: cut an app off from the network, in either direction.
 - **Priorities** (Low / Normal / High / Critical) inside a **total bandwidth
   cap**, so a call or a game stays smooth while a download runs.
 - **Daily quotas**: an app is blocked until midnight once it has used its allowance.
+- **Schedules**: any rule can apply only on chosen days and times, including
+  overnight windows such as 22:00 to 06:00.
+- **Per-process rules**: split an app such as Chrome into one row per running
+  process and limit just one of them.
+- **Website rules**: block or limit a site (and its subdomains), an IP address
+  or a range, for every app at once. Presets for YouTube, Netflix, TikTok,
+  Instagram and Facebook, Twitch, Steam downloads and Windows Update.
+- **Connection log**: every new connection with time, app, destination name,
+  port and whether it was allowed or blocked.
+- **Ask before new apps connect**: firewall-style prompts. A new app's
+  traffic is held until you allow or block it, and the answer is remembered.
+- **Notification area icon**: closing the window keeps your limits running;
+  live speeds in the tooltip; right-click to pause all rules or quit.
+- **Start with Windows** through Task Scheduler, so it starts elevated at
+  sign-in without a permission prompt.
 - **Usage history**: 30 days of per-app and per-day totals.
-- Rules are saved per executable and apply the next time the app starts.
-- Master switches for the blocker, limiter and priorities; right-click an app
-  for presets.
 
 ## Running it
 
@@ -76,9 +87,15 @@ round-robin inside a priority class. Queues are short (0.6 s of traffic), so a
 sender that outruns its limit loses packets and TCP slows itself down. A low
 priority app still gets one packet every 250 ms, so it is never starved to zero.
 
+**Website rules** (`internal/sites`). The engine reads every DNS answer that
+passes by and remembers which name each IP address was looked up as. A packet
+to an address covered by a website rule is shaped by that rule's own token
+bucket, shared by every app; the app's own blocks and quota still apply.
+
 **Core** (`internal/core`). Owns the shaper and the engine, samples counters
-once a second, stores rules and usage as JSON in `%AppData%\Bandwidth Pilot`, and
-answers the interface's calls.
+once a second, switches scheduled rules on and off, keeps the connection log,
+holds new apps that need approval, and stores rules, known apps and usage as
+JSON in `%AppData%\Bandwidth Pilot`.
 
 **Interface** (`ui/`). Preact, bundled by esbuild into a single HTML file that
 is embedded in the executable. The Windows shell is a Win32 window hosting
@@ -137,6 +154,10 @@ pieces:
 - Windows services share `svchost.exe`, so they appear as one app.
 - IPv4 fragments and protocols other than TCP and UDP are passed through
   untouched and uncounted.
+- Website rules match by name only when DNS is visible. Browsers using
+  "secure DNS" (DNS over HTTPS) hide it; use the site's IP range instead.
+- Per-process rules last until that process exits (process ids are not reused
+  safely across runs).
 
 ## Layout
 
@@ -144,7 +165,8 @@ pieces:
 cmd/bandwidthpilot/        entry point, window shell, localhost server for --serve
 internal/shaper/     token buckets, priority scheduler, quotas (+ tests)
 internal/engine/     WinDivert engine, process and icon lookup, demo engine
-internal/core/       service, rule and usage stores, RPC
+internal/sites/      website rules, DNS answer parser (+ tests)
+internal/core/       service, rule and usage stores, prompts, log, RPC (+ tests)
 internal/ui/         embedded build of the interface
 ui/                  interface source (Preact)
 build/               icon, manifest, version resource
