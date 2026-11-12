@@ -24,10 +24,13 @@ func runShell(sv *core.Service, o options) error {
 	}
 	runtime.LockOSThread()
 
-	// One instance only: two would fight over the same packets.
+	// One instance only: two would fight over the same packets. A second
+	// launch brings the running window to the front instead.
 	name, _ := windows.UTF16PtrFromString("Local\\BandwidthPilotSingleInstance")
 	if _, err := windows.CreateMutex(nil, false, name); err == windows.ERROR_ALREADY_EXISTS {
-		messageBox("Bandwidth Pilot is already running.")
+		if !showExisting() {
+			messageBox("Bandwidth Pilot is already running.")
+		}
 		return nil
 	}
 
@@ -57,7 +60,11 @@ func runShell(sv *core.Service, o options) error {
 	}
 	defer w.Destroy()
 
-	styleWindow(windows.HWND(uintptr(w.Window())))
+	hwnd := windows.HWND(uintptr(w.Window()))
+	if o.tray {
+		showWindow(hwnd, swHide)
+	}
+	styleWindow(hwnd)
 	minW, minH := windowSize(980, 600)
 	w.SetSize(int(minW), int(minH), webview2.HintMin)
 	if err := w.Bind("pilotCall", func(method string, params json.RawMessage) (interface{}, error) {
@@ -65,6 +72,8 @@ func runShell(sv *core.Service, o options) error {
 	}); err != nil {
 		return err
 	}
+	t := newTray(sv, w, hwnd, o.dir)
+	defer t.remove()
 	w.SetHtml(ui.HTML(""))
 	w.Run()
 	return nil

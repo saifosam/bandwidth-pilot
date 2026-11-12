@@ -14,7 +14,7 @@ import (
 	"bandwidthpilot/internal/engine"
 )
 
-const version = "0.2.0"
+const version = "0.3.0"
 
 type options struct {
 	demo   bool
@@ -22,6 +22,8 @@ type options struct {
 	port   int
 	noOpen bool
 	debug  bool
+	tray   bool
+	dir    string
 }
 
 func main() {
@@ -32,6 +34,7 @@ func main() {
 	flag.IntVar(&o.port, "port", 0, "port for --serve (default: pick a free one)")
 	flag.BoolVar(&o.noOpen, "no-open", false, "with --serve, do not open a browser")
 	flag.BoolVar(&o.debug, "debug", false, "enable the web inspector in the window")
+	flag.BoolVar(&o.tray, "tray", false, "start minimised to the notification area (used when starting with Windows)")
 	flag.Parse()
 
 	dir := dataDir()
@@ -40,6 +43,7 @@ func main() {
 		dir = filepath.Join(dir, "demo")
 	}
 	os.MkdirAll(dir, 0o755)
+	o.dir = dir
 
 	if *selftest {
 		var w io.Writer = os.Stdout
@@ -64,9 +68,9 @@ func main() {
 	defer sv.Close()
 
 	if o.demo {
-		sv.UseEngine(engine.NewDemo(sv.S))
+		sv.UseEngine(engine.NewDemo(sv.S, sv.Opts))
 	} else {
-		live, err := engine.NewLive(sv.S, logf)
+		live, err := engine.NewLive(sv.S, sv.Opts)
 		if err == nil {
 			err = sv.UseEngine(live)
 		}
@@ -76,7 +80,7 @@ func main() {
 				// Show the reason in the window; the user can switch to the demo.
 				sv.UseEngine(engine.NewFailed(err.Error()))
 			} else {
-				sv.UseEngine(engine.NewDemo(sv.S))
+				sv.UseEngine(engine.NewDemo(sv.S, sv.Opts))
 			}
 		}
 	}
